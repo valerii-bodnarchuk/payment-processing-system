@@ -35,7 +35,6 @@ deleted here.
 from __future__ import annotations
 
 import hashlib
-import uuid
 from typing import Awaitable, Callable
 
 import asyncpg
@@ -166,146 +165,25 @@ async def seed_eval_fixtures(conn: asyncpg.Connection) -> dict[str, int]:
 async def _build_placeholder_scenario(
     conn: asyncpg.Connection, scenario_key: str, marker: str
 ) -> int:
-    """Clear-cut fraud case: high fraud score, BLOCK decision the agent should
-    confirm as TRUE_POSITIVE.
+    """TODO(domain): implement the data pattern for 'placeholder_scenario'.
+
+    Which data pattern justifies which verdict is the domain question to answer
+    here — e.g. what combination of fraud score, payout history, dispute state,
+    ledger balance and account age makes this case a TRUE_POSITIVE vs a
+    FALSE_POSITIVE vs INCONCLUSIVE (the label lives in eval/golden.jsonl).
 
     Marker placement (contamination-safe — NOT seen by the LLM):
         Transaction.description = marker
         Account.name            = marker   (BUYER and SELLER accounts)
 
-    LLM-VISIBLE — domain-plausible, zero 'eval'/'test'/marker:
+    LLM-VISIBLE — MUST be domain-plausible, ZERO 'eval'/'test'/marker:
         Seller.name, Seller.email, Seller.stripeAccountId, Payout.failureReason
+
+    Must return the inserted transaction_id.
     """
-    suffix = uuid.uuid4().hex[:8]
-
-    # ── Lookup pre-existing platform accounts ──────────────────────────
-    escrow_row = await conn.fetchrow(
-        'SELECT id FROM "Account" WHERE type = $1 ORDER BY id LIMIT 1',
-        "ESCROW",
+    raise NotImplementedError(
+        f"eval builder for scenario '{scenario_key}' is not implemented yet"
     )
-    if not escrow_row:
-        raise RuntimeError(
-            'Platform ESCROW account not found. Run `npm run prisma:seed`.'
-        )
-    escrow_account_id: int = escrow_row["id"]
-
-    fee_row = await conn.fetchrow(
-        'SELECT id FROM "Account" WHERE type = $1 ORDER BY id LIMIT 1',
-        "PLATFORM_FEE",
-    )
-    if not fee_row:
-        raise RuntimeError(
-            'Platform FEE account not found. Run `npm run prisma:seed`.'
-        )
-    platform_fee_account_id: int = fee_row["id"]
-
-    # Buyer account (DEBIT source)
-    buyer_row = await conn.fetchrow(
-        """
-        INSERT INTO "Account" (name, type, "allowNegative", "createdAt")
-        VALUES ($1, $2, TRUE, NOW())
-        RETURNING id
-        """,
-        marker,
-        "BUYER",
-    )
-    buyer_account_id: int = buyer_row["id"]
-
-    # Seller ledger account
-    seller_account_row = await conn.fetchrow(
-        """
-        INSERT INTO "Account" (name, type, "allowNegative", "createdAt")
-        VALUES ($1, $2, TRUE, NOW())
-        RETURNING id
-        """,
-        marker,
-        "SELLER",
-    )
-    seller_account_id: int = seller_account_row["id"]
-
-    # Seller entity (ACTIVE so risk-profile and timeline endpoints work)
-    seller_row = await conn.fetchrow(
-        """
-        INSERT INTO "Seller" (
-            name, email, status, "accountId",
-            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
-            "payoutsBlocked", "negativeBalance",
-            "createdAt", "updatedAt"
-        ) VALUES (
-            $1, $2, 'ACTIVE', $3,
-            $4, TRUE, TRUE,
-            FALSE, 0,
-            NOW(), NOW()
-        ) RETURNING id
-        """,
-        f"Marcus Ferreira {suffix}",
-        f"marcus.ferreira.{suffix}@sellerhub.io",
-        seller_account_id,
-        f"acct_{suffix}",
-    )
-    seller_id: int = seller_row["id"]
-
-    # COMPLETED transaction
-    tx_row = await conn.fetchrow(
-        """
-        INSERT INTO "Transaction" (description, status, "createdAt")
-        VALUES ($1, 'COMPLETED', NOW())
-        RETURNING id
-        """,
-        marker,
-    )
-    transaction_id: int = tx_row["id"]
-
-    # Balanced ledger entries: buyer DEBIT <-> escrow CREDIT
-    amount = 100_000  # EUR 1 000 in cents
-    await conn.execute(
-        """
-        INSERT INTO "Entry" ("accountId", "transactionId", amount, type, "createdAt")
-        VALUES ($1, $2, $3, 'DEBIT', NOW())
-        """,
-        buyer_account_id,
-        transaction_id,
-        amount,
-    )
-    await conn.execute(
-        """
-        INSERT INTO "Entry" ("accountId", "transactionId", amount, type, "createdAt")
-        VALUES ($1, $2, $3, 'CREDIT', NOW())
-        """,
-        escrow_account_id,
-        transaction_id,
-        amount,
-    )
-
-    # PENDING payout with a high fraud score — clear-cut BLOCK
-    payout_amount = 50_000   # EUR 500
-    platform_fee = 2_500     # 5 %
-    seller_amount = payout_amount - platform_fee
-
-    await conn.execute(
-        """
-        INSERT INTO "Payout" (
-            status, amount, "platformFee", "sellerAmount",
-            "transactionId", "sellerId",
-            "escrowAccountId", "platformFeeAccountId",
-            attempts, "maxAttempts",
-            "fraudDecision", "fraudScore",
-            "createdAt", "updatedAt"
-        ) VALUES (
-            'PENDING', $1, $2, $3,
-            $4, $5,
-            $6, $7,
-            0, 3,
-            'BLOCK', 0.85,
-            NOW(), NOW()
-        )
-        """,
-        payout_amount, platform_fee, seller_amount,
-        transaction_id, seller_id,
-        escrow_account_id, platform_fee_account_id,
-    )
-
-    return transaction_id
 
 
 # scenario_key -> builder. Keys MUST match the "scenario" field in golden.jsonl.
