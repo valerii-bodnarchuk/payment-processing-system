@@ -389,20 +389,34 @@ async def _build_high_score_clean_history(
     the seller's history — the agent has to reach a different conclusion from
     behaviour alone rather than from the score.
 
-    What rules.yaml would actually compute for THIS history:
+    What rules.yaml computes for THIS history:
 
         amount_threshold  amount 45000 >= 10000        +0.50
-        daily_volume      45000 >= 20000               +0.15
+        daily_volume      see below                    +0.15 or +0.40
         velocity          1 payout/24h  < 5             0.00
         new_account       age 4y       >= 30d           0.00
         failed_history    0 failures    < 2             0.00
         dispute_rate      0 disputes    < 1             0.00
-        ------------------------------------------------------
-        recomputed 0.65 -> REVIEW band, NOT block
 
-    The stored score is 0.85 (BLOCK), driven purely by transaction size: every
-    behavioural rule is zero. This is the discriminator — the agent has to
-    notice the score has nothing behind it.
+    MEASURED, not assumed — daily_volume decides the outcome, and it depends on
+    what the caller passes (engine.py: total = seller_total_amount_24h + amount,
+    i.e. the engine expects PRIOR volume and adds the current amount itself):
+
+        seller_total_amount_24h=0      -> total  45000 -> +0.15 -> 0.65 REVIEW
+        seller_total_amount_24h=45000  -> total  90000 -> +0.40 -> 0.90 BLOCK
+
+    `get_seller_risk_profile` reports totalVolume24h over ALL payouts in the
+    window INCLUDING the one under investigation, so an agent that forwards it
+    verbatim double-counts this payout and the engine returns 0.90 BLOCK —
+    ABOVE the stored 0.85. The intended contradiction (recomputed < stored)
+    then disappears and the score looks corroborated instead.
+
+    So this scenario only discriminates if the agent passes prior-window volume
+    (excluding the current payout). Confirmed against the live pipeline; both
+    numbers above came from POST /check/explain, not from arithmetic on paper.
+    Resolving this is a domain call: either treat "does the agent avoid the
+    double-count" as part of what is being measured, or move the case onto a
+    signal that does not route through daily_volume.
 
     Matches the existing labelled precedent in the corpus: SYN-017
     (agent/rag/synthetic_cases.py, cluster `legitimate_high_risk`) is a
