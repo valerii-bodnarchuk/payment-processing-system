@@ -77,8 +77,14 @@ def _audit_retrieval(state: dict) -> dict:
 # ── Single case ─────────────────────────────────────────────────────────────
 
 async def run_case(graph, case: dict, transaction_id: int) -> dict:
-    """Invoke the graph for one golden case and score it."""
+    """Invoke the graph for one golden case and score it.
+
+    An unlabelled case (expected.verdict == UNLABELLED) is run and reported but
+    left unscored: `passed` is None so it lands in neither the numerator nor the
+    denominator of the accuracy figure.
+    """
     expected = case["expected"]["verdict"]
+    unlabelled = case.get("unlabelled", False)
 
     try:
         state = await graph.ainvoke({
@@ -88,7 +94,9 @@ async def run_case(graph, case: dict, transaction_id: int) -> dict:
     except Exception as exc:  # noqa: BLE001 — a crashed case is a failed case
         return {
             "id": case["id"], "scenario": case["scenario"],
-            "expected": expected, "actual": None, "passed": False,
+            "expected": expected, "actual": None,
+            "passed": None if unlabelled else False,
+            "unlabelled": unlabelled,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -100,7 +108,8 @@ async def run_case(graph, case: dict, transaction_id: int) -> dict:
     return {
         "id": case["id"], "scenario": case["scenario"],
         "expected": expected, "actual": verdict,
-        "passed": verdict == expected,
+        "passed": None if unlabelled else verdict == expected,
+        "unlabelled": unlabelled,
         "iterations": state.get("iteration", 0),
         "transaction_id": transaction_id,
         "retrieval": _audit_retrieval(state),
@@ -135,11 +144,19 @@ async def run_eval(golden_path: str, dsn: str, do_seed: bool = True) -> dict:
     results = [
         await run_case(graph, case, mapping[case["scenario"]]) for case in cases
     ]
-    passed = sum(1 for r in results if r["passed"])
+    return summarise(results)
+
+
+def summarise(results: list[dict]) -> dict:
+    """Accuracy over SCORED cases only — unlabelled ones are excluded from both
+    the numerator and the denominator, and counted separately."""
+    scored = [r for r in results if r.get("passed") is not None]
+    passed = sum(1 for r in scored if r["passed"])
     return {
-        "total": len(results),
+        "total": len(scored),
         "passed": passed,
-        "accuracy": round(passed / len(results), 4) if results else 0.0,
+        "unlabelled": len(results) - len(scored),
+        "accuracy": round(passed / len(scored), 4) if scored else 0.0,
         "results": results,
     }
 
@@ -169,7 +186,9 @@ def print_report(report: dict) -> None:
     print(f"\n{'case':36s} {'expected':16s} {'actual':16s} result")
     print("-" * 82)
     for r in report["results"]:
-        mark = "PASS" if r["passed"] else "FAIL"
+        mark = "—    (unlabelled)" if r["passed"] is None else (
+            "PASS" if r["passed"] else "FAIL"
+        )
         actual = r["actual"] or r.get("error", "—")
         print(f"{r['id']:36s} {r['expected']:16s} {str(actual):16s} {mark}")
 
@@ -182,7 +201,10 @@ def print_report(report: dict) -> None:
             )
 
     print("-" * 82)
-    print(f"passed {report['passed']}/{report['total']}  accuracy {report['accuracy']}")
+    line = f"passed {report['passed']}/{report['total']}  accuracy {report['accuracy']}"
+    if report.get("unlabelled"):
+        line += f"  ({report['unlabelled']} unlabelled, not scored)"
+    print(line)
 
 
 def main() -> None:

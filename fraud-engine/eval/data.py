@@ -14,6 +14,15 @@ concrete transaction_id at seed time (see eval/seed.py), never a raw id.
 
 Validation is strict — an invalid case fails loudly with file:line context so a
 malformed golden set can never silently skew an eval run.
+
+Unlabelled cases
+----------------
+`expected.verdict` may be the placeholder "UNLABELLED" for a case whose fixture
+and arithmetic are settled but whose label has not been decided yet. Such a case
+still seeds and still runs — so its measured behaviour can be inspected — but it
+is NOT scored, and the runner keeps it out of the accuracy denominator. Assigning
+a real verdict is a deliberate human act; a placeholder must never silently
+count as a pass or a fail.
 """
 from __future__ import annotations
 
@@ -24,6 +33,11 @@ from pathlib import Path
 # (agent/state.py: trigger, and the synthesised verdict).
 VALID_TRIGGERS = frozenset({"BLOCK", "REVIEW", "MANUAL"})
 VALID_VERDICTS = frozenset({"TRUE_POSITIVE", "FALSE_POSITIVE", "INCONCLUSIVE"})
+
+# Stand-in for "fixture is ready, label is not". Accepted by the loader, never
+# scored by the runner. Deliberately not a member of VALID_VERDICTS so it can
+# never be mistaken for a real label anywhere downstream.
+PLACEHOLDER_VERDICT = "UNLABELLED"
 
 _REQUIRED_KEYS = ("id", "scenario", "trigger", "expected")
 
@@ -58,6 +72,7 @@ def load_golden(path: str | Path) -> list[dict]:
             if case_id in seen_ids:
                 raise ValueError(f"{p}:{lineno}: duplicate case id {case_id!r}")
             seen_ids.add(case_id)
+            case["unlabelled"] = case["expected"]["verdict"] == PLACEHOLDER_VERDICT
             cases.append(case)
 
     if not cases:
@@ -94,8 +109,9 @@ def _validate_case(case: object, p: Path, lineno: int) -> None:
         raise ValueError(f"{where}: 'expected' must be an object with a 'verdict' key")
 
     verdict = expected["verdict"]
-    if verdict not in VALID_VERDICTS:
+    if verdict not in VALID_VERDICTS and verdict != PLACEHOLDER_VERDICT:
         raise ValueError(
             f"{where}: invalid expected.verdict {verdict!r}; "
-            f"expected one of {sorted(VALID_VERDICTS)}"
+            f"expected one of {sorted(VALID_VERDICTS)} "
+            f"or {PLACEHOLDER_VERDICT!r} for a case awaiting its label"
         )

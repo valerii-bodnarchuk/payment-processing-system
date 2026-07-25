@@ -65,10 +65,16 @@ def make_scripted_judge(trace):
             trace["stored_decision"] = (report.get("context") or {}).get("fraudDecision")
             trace["seller_id"] = report.get("sellerId")
             trace["amount"] = report.get("amount")
+            trace["payout_id"] = report.get("payoutId")
 
         if step == 2:
+            # The payout under investigation is excluded from the window volume:
+            # the engine's daily_volume rule adds `amount` back itself, so
+            # forwarding the unfiltered total would count this payout twice.
+            # Every OTHER payout in the window stays in the aggregate.
             return _tool_call("get_seller_risk_profile",
-                              {"seller_id": trace["seller_id"]}, "c2")
+                              {"seller_id": trace["seller_id"],
+                               "exclude_payout_id": trace["payout_id"]}, "c2")
 
         prof = _last_tool_output(messages, "get_seller_risk_profile")
         if prof and prof.get("riskMetrics"):
@@ -140,13 +146,17 @@ def make_scripted_judge(trace):
 
 
 async def main():
+    import os
+
     import asyncpg
     from eval.data import load_golden
     from eval.guard import assert_no_contamination
     from eval.seed import seed_eval_fixtures
-    from eval.runner import run_case, print_report
+    from eval.runner import run_case, print_report, summarise
 
-    DSN = "postgresql://postgres@127.0.0.1:55432/payment_system"
+    # Same default as eval/runner.py — matches docker-compose.dev.yml.
+    DSN = os.getenv("DATABASE_URL",
+                    "postgresql://postgres:postgres@127.0.0.1:5432/payment_system")
     conn = await asyncpg.connect(DSN)
     mapping = await seed_eval_fixtures(conn)
     await conn.close()
@@ -166,12 +176,7 @@ async def main():
             graph = build_investigation_graph()
             results.append(await run_case(graph, case, tx_id))
 
-    print_report({
-        "total": len(results),
-        "passed": sum(1 for r in results if r["passed"]),
-        "accuracy": round(sum(1 for r in results if r["passed"]) / len(results), 4),
-        "results": results,
-    })
+    print_report(summarise(results))
 
     print("\n=== что агент реально увидел ===")
     for cid, t in traces.items():

@@ -464,8 +464,125 @@ async def _build_high_score_clean_history(
     return main_tx
 
 
+async def _build_pending_burst_volume_spike(
+    conn: asyncpg.Connection, scenario_key: str, marker: str
+) -> int:
+    """A burst of UNSETTLED payouts inside the window — daily_volume MUST fire.
+
+    Regression guard for the risk-profile aggregate itself, not for the LLM.
+    The window volume here lives entirely in payouts that have NOT settled yet
+    (all PENDING), which is exactly the shape a payout-draining seller has: the
+    money is queued, not paid out. Any implementation of `totalVolume24h` that
+    drops unsettled payouts wholesale reports ~0 for this seller and silently
+    turns the spike invisible.
+
+    Score arithmetic (fraud-engine/config/rules.yaml, weights all 1.0,
+    total = min(sum, 1.0), BLOCK above 0.7). The engine computes daily_volume
+    as `seller_total_amount_24h + amount`, i.e. it expects PRIOR window volume
+    and adds the payout under investigation itself:
+
+        amount_threshold  amount 9000 >= 5000          +0.20
+        velocity          6 payouts/24h >= 5           +0.20
+        failed_history    2 failures/7d >= 2           +0.20
+        new_account       age 210d     >= 30d           0.00
+        dispute_rate      0 disputes    < 1             0.00
+        daily_volume      depends on the aggregate — see below
+
+    daily_volume is the ONLY rule that moves, and it decides the band:
+
+        prior 45000 (the five other PENDINGs)  -> total 54000 -> +0.40 -> 1.00 BLOCK
+        prior 0     (unsettled dropped)        -> total  9000 ->  0.00 -> 0.60 REVIEW
+
+    So an aggregate that excludes unsettled payouts costs this case its BLOCK
+    and, downstream, its verdict. Contrast with `high_score_clean_history`,
+    which pins the opposite error (counting the investigated payout twice);
+    together the two bracket `totalVolume24h` from both sides.
+
+    Placement note (adjustable): the two FAILED payouts sit 3d and 4d back —
+    inside failed_history's 7d lookback but OUTSIDE the 24h window, so they
+    contribute a behavioural signal without touching the volume arithmetic
+    above. Move them inside 24h only if the volume numbers are recomputed.
+    """
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible merchant identity, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '210 days', NOW() - INTERVAL '2 days'
+        ) RETURNING id
+        """,
+        "Nordvik Outdoor Equipment",
+        "finance@nordvik-outdoor.no",
+        seller_account_id,
+        "acct_1QfNordvikOutdoor",
+    )
+    seller_id = seller["id"]
+
+    # failed_history: two FAILED payouts inside the 7d lookback but outside the
+    # 24h window, so they never enter the volume arithmetic.
+    for i, (days_ago, reason) in enumerate(
+        ((3, "Stripe transfer failed: insufficient_funds in platform balance"),
+         (4, "Stripe transfer failed: account_frozen on destination account")),
+    ):
+        failed_tx = await _insert_settled_transaction(
+            conn, marker, f"failed-{i + 1}", buyer_account_id, escrow_id,
+            amount=8_000, age_interval=f"{days_ago} days",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=failed_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=8_000, status="FAILED",
+            fraud_decision="ALLOW", fraud_score=0.20,
+            age_interval=f"{days_ago} days",
+            attempts=3, failure_reason=reason,
+        )
+
+    # The burst: five PENDING payouts stacked up inside the window, 45000 total.
+    # None of them settled — this is the volume the daily_volume rule exists for.
+    for i, hours_ago in enumerate((2, 5, 8, 12, 18)):
+        burst_tx = await _insert_settled_transaction(
+            conn, marker, f"burst-{i + 1}", buyer_account_id, escrow_id,
+            amount=9_000, age_interval=f"{hours_ago} hours",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=burst_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=9_000, status="PENDING",
+            fraud_decision="ALLOW", fraud_score=0.25,
+            age_interval=f"{hours_ago} hours",
+        )
+
+    # Transaction under investigation — the sixth payout of the burst.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=9_000,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=9_000, status="PENDING",
+        fraud_decision="BLOCK", fraud_score=0.95,
+    )
+    return main_tx
+
+
 # scenario_key -> builder. Keys MUST match the "scenario" field in golden.jsonl.
 SCENARIO_BUILDERS: dict[str, Builder] = {
     "fraud_confirmed_by_history": _build_fraud_confirmed_by_history,
     "high_score_clean_history": _build_high_score_clean_history,
+    "pending_burst_volume_spike": _build_pending_burst_volume_spike,
 }

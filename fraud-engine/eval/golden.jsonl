@@ -1,2 +1,3 @@
 {"id": "case-001-fraud-confirmed", "scenario": "fraud_confirmed_by_history", "trigger": "BLOCK", "expected": {"verdict": "TRUE_POSITIVE"}}
 {"id": "case-002-high-score-clean-history", "scenario": "high_score_clean_history", "trigger": "BLOCK", "expected": {"verdict": "FALSE_POSITIVE"}}
+{"id": "case-003-pending-burst-volume-spike", "scenario": "pending_burst_volume_spike", "trigger": "BLOCK", "expected": {"verdict": "UNLABELLED"}}
