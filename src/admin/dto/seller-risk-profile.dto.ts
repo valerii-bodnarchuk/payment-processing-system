@@ -19,11 +19,31 @@ export class SellerRiskMetricsDto {
   @ApiProperty({ description: 'Disputes resolved as LOST (buyer won)' })
   lostDisputes!: number;
 
-  @ApiProperty({ description: 'Payouts created in the last 24 hours' })
+  @ApiProperty({
+    description:
+      'Payouts created in the last 24 hours. Always the full window count — ' +
+      'never reduced by `excludePayoutId`, because the fraud engine\'s velocity ' +
+      'rule compares this number directly without adding the payout under ' +
+      'investigation back in.',
+  })
   payoutVelocity24h!: number;
 
-  @ApiProperty({ description: 'Total payout volume in cents in the last 24 hours' })
+  @ApiProperty({
+    description:
+      'Total payout volume in cents in the last 24 hours, across ALL statuses — ' +
+      'unsettled payouts included, since a stack of them is exactly the spike ' +
+      'the daily_volume rule looks for. Reduced by exactly one payout when ' +
+      '`excludePayoutId` is passed (see `volume24hExcludesPayoutId`).',
+  })
   totalVolume24h!: number;
+
+  @ApiProperty({
+    description:
+      'The payout id excluded from `totalVolume24h`, or null when the total ' +
+      'covers the whole window. Makes the figure unambiguous to its consumers.',
+    nullable: true,
+  })
+  volume24hExcludesPayoutId!: number | null;
 
   @ApiProperty({ description: 'Total lifetime payout volume in cents' })
   totalVolumeLifetime!: number;

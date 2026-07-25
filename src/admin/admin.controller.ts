@@ -102,8 +102,24 @@ export class AdminController {
       '(payout velocity, dispute rate, volume trends) in a single response. ' +
       'Designed for the fraud investigation agent and ops dashboard.',
   })
-  async getSellerRiskProfile(@Param('id', ParseIntPipe) id: number) {
-    return this.adminService.getSellerRiskProfile(id);
+  @ApiQuery({
+    name: 'excludePayoutId',
+    required: false,
+    type: Number,
+    description:
+      'Omit this single payout from `totalVolume24h` — nothing else changes. ' +
+      'Pass the payout under investigation when the result feeds the fraud ' +
+      "engine: its daily_volume rule adds that payout's amount back itself, so " +
+      'an unfiltered total double-counts it. All other payouts in the window, ' +
+      'including unsettled ones, stay in the total, and `payoutVelocity24h` is ' +
+      'unaffected. Omit for the plain window total (default).',
+  })
+  async getSellerRiskProfile(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('excludePayoutId', new ParseIntPipe({ optional: true }))
+    excludePayoutId?: number,
+  ) {
+    return this.adminService.getSellerRiskProfile(id, excludePayoutId);
   }
 
   @Get('sellers/:id/payout-timeline')

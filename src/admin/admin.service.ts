@@ -100,8 +100,24 @@ export class AdminService {
    * Aggregate all risk-relevant data for a seller into a single response.
    * Designed for fraud investigation — combines seller record, ledger balance,
    * and computed risk metrics in one round-trip.
+   *
+   * `excludePayoutId` omits exactly one payout — the one under investigation —
+   * from `totalVolume24h`, and nothing else. Callers that feed the fraud engine
+   * need this because `check_daily_volume` computes
+   * `seller_total_amount_24h + amount`, i.e. it adds the payout being scored
+   * back in itself; forwarding the unfiltered total counts that payout twice.
+   * Mirrors the production call site (payout.service.ts::markEligible), which
+   * passes prior settled volume for the same reason.
+   *
+   * The exclusion is deliberately narrow. It does NOT filter by status: a
+   * seller with a stack of unsettled payouts is precisely the spike the
+   * daily_volume rule exists to catch, so every other payout in the window —
+   * PENDING included — stays in the total. It also leaves `payoutVelocity24h`
+   * untouched, because `check_velocity` does NOT add the current payout back
+   * (it compares `seller_payout_count_24h` directly), so the count must keep
+   * including the payout under investigation to stay engine-accurate.
    */
-  async getSellerRiskProfile(sellerId: number) {
+  async getSellerRiskProfile(sellerId: number, excludePayoutId?: number) {
     const seller = await this.prisma.seller.findUnique({
       where: { id: sellerId },
     });
@@ -161,7 +177,11 @@ export class AdminService {
       totalVolumeLifetime += p.amount;
     }
 
-    const totalVolume24h = payouts24h.reduce((sum, p) => sum + p.amount, 0);
+    // Filtered here rather than in the query: velocity must still count every
+    // payout in the window, including the excluded one. See the method doc.
+    const totalVolume24h = payouts24h
+      .filter((p) => p.id !== excludePayoutId)
+      .reduce((sum, p) => sum + p.amount, 0);
     const accountAgeDays = Math.floor(
       (now - seller.createdAt.getTime()) / (24 * 60 * 60 * 1000),
     );
@@ -204,6 +224,7 @@ export class AdminService {
         lostDisputes,
         payoutVelocity24h: payouts24h.length,
         totalVolume24h,
+        volume24hExcludesPayoutId: excludePayoutId ?? null,
         totalVolumeLifetime,
         avgPayoutAmount:
           allPayouts.length > 0

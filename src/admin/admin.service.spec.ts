@@ -171,6 +171,70 @@ describe('AdminService', () => {
 
       expect(profile.riskMetrics.payoutVelocity24h).toBe(2);
       expect(profile.riskMetrics.totalVolume24h).toBe(12000);
+      expect(profile.riskMetrics.volume24hExcludesPayoutId).toBeNull();
+    });
+
+    // Regression: the fraud engine's daily_volume rule computes
+    // `seller_total_amount_24h + amount`, so a caller scoring one payout must
+    // hand it the window MINUS that payout — and minus nothing else. Excluding
+    // by status instead (e.g. dropping every PENDING) would zero out exactly
+    // the burst the rule is meant to catch.
+    it('should exclude only the named payout from totalVolume24h, keeping other pending ones', async () => {
+      const txs = await Promise.all([
+        createTransaction(9000),
+        createTransaction(9000),
+        createTransaction(9000),
+        createTransaction(9000),
+      ]);
+
+      const [investigated, ...others] = await Promise.all(
+        txs.map((tx) => createPayout(tx.id, 9000, { status: 'PENDING' })),
+      );
+
+      const profile = await service.getSellerRiskProfile(
+        sellerId,
+        investigated.id,
+      );
+
+      // The three other PENDING payouts survive the exclusion — only the
+      // investigated one is gone.
+      expect(profile.riskMetrics.totalVolume24h).toBe(27000);
+      expect(profile.riskMetrics.volume24hExcludesPayoutId).toBe(
+        investigated.id,
+      );
+      expect(others).toHaveLength(3);
+
+      // Velocity still counts the full window: check_velocity compares the
+      // count directly and never adds the investigated payout back in.
+      expect(profile.riskMetrics.payoutVelocity24h).toBe(4);
+    });
+
+    it('should count the whole window when excludePayoutId is omitted', async () => {
+      const txs = await Promise.all([
+        createTransaction(9000),
+        createTransaction(9000),
+        createTransaction(9000),
+        createTransaction(9000),
+      ]);
+      await Promise.all(
+        txs.map((tx) => createPayout(tx.id, 9000, { status: 'PENDING' })),
+      );
+
+      const profile = await service.getSellerRiskProfile(sellerId);
+
+      expect(profile.riskMetrics.totalVolume24h).toBe(36000);
+      expect(profile.riskMetrics.volume24hExcludesPayoutId).toBeNull();
+      expect(profile.riskMetrics.payoutVelocity24h).toBe(4);
+    });
+
+    it('should ignore an excludePayoutId that is not in the window', async () => {
+      const tx = await createTransaction(9000);
+      await createPayout(tx.id, 9000, { status: 'PENDING' });
+
+      const profile = await service.getSellerRiskProfile(sellerId, 999999);
+
+      expect(profile.riskMetrics.totalVolume24h).toBe(9000);
+      expect(profile.riskMetrics.payoutVelocity24h).toBe(1);
     });
 
     it('should track timeSinceLastFailure', async () => {
