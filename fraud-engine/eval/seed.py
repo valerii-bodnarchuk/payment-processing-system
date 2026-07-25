@@ -145,49 +145,313 @@ async def seed_eval_fixtures(conn: asyncpg.Connection) -> dict[str, int]:
     return result
 
 
+# ── Insert helpers ──────────────────────────────────────────────────────────
+#
+# Mirror tests/conftest.py::seed_blocked_payout: platform ESCROW / PLATFORM_FEE
+# accounts are looked up read-only, everything else is inserted per scenario.
+
+
+async def _lookup_platform_accounts(conn: asyncpg.Connection) -> tuple[int, int]:
+    """(escrow_account_id, platform_fee_account_id) from `npm run prisma:seed`."""
+    escrow = await conn.fetchrow(
+        'SELECT id FROM "Account" WHERE type = $1 ORDER BY id LIMIT 1', "ESCROW"
+    )
+    fee = await conn.fetchrow(
+        'SELECT id FROM "Account" WHERE type = $1 ORDER BY id LIMIT 1', "PLATFORM_FEE"
+    )
+    if not escrow or not fee:
+        raise RuntimeError(
+            "Platform ESCROW / PLATFORM_FEE accounts not found. "
+            "Run `npm run prisma:seed` before seeding eval fixtures."
+        )
+    return escrow["id"], fee["id"]
+
+
+async def _insert_account(
+    conn: asyncpg.Connection, marker: str, account_type: str
+) -> int:
+    """Account.name carries the marker — never serialised to the LLM."""
+    row = await conn.fetchrow(
+        """
+        INSERT INTO "Account" (name, type, "allowNegative", "createdAt")
+        VALUES ($1, $2, TRUE, NOW())
+        RETURNING id
+        """,
+        marker,
+        account_type,
+    )
+    return row["id"]
+
+
+async def _insert_settled_transaction(
+    conn: asyncpg.Connection,
+    marker: str,
+    label: str,
+    buyer_account_id: int,
+    escrow_account_id: int,
+    amount: int,
+    age_interval: str = "0 days",
+) -> int:
+    """COMPLETED transaction with balanced buyer DEBIT / escrow CREDIT entries.
+
+    Entries MUST balance: LedgerService.verifyIntegrity() runs a per-transaction
+    GROUP BY/HAVING check, and any imbalance would fire the unrelated
+    `ledger_imbalanced` critical finding and pollute the scenario.
+
+    Balance convention (ledger.service.ts:284): CREDIT adds, DEBIT subtracts —
+    so the escrow CREDIT is what funds the payout.
+    """
+    tx = await conn.fetchrow(
+        f"""
+        INSERT INTO "Transaction" (description, status, "createdAt")
+        VALUES ($1, 'COMPLETED', NOW() - INTERVAL '{age_interval}')
+        RETURNING id
+        """,
+        f"{marker} {label}",
+    )
+    tx_id = tx["id"]
+
+    for account_id, entry_type in ((buyer_account_id, "DEBIT"), (escrow_account_id, "CREDIT")):
+        await conn.execute(
+            f"""
+            INSERT INTO "Entry" ("accountId", "transactionId", amount, type, "createdAt")
+            VALUES ($1, $2, $3, '{entry_type}', NOW() - INTERVAL '{age_interval}')
+            """,
+            account_id,
+            tx_id,
+            amount,
+        )
+    return tx_id
+
+
+async def _insert_payout(
+    conn: asyncpg.Connection,
+    *,
+    transaction_id: int,
+    seller_id: int,
+    escrow_account_id: int,
+    platform_fee_account_id: int,
+    amount: int,
+    status: str,
+    fraud_decision: str,
+    fraud_score: float,
+    age_interval: str = "0 days",
+    attempts: int = 0,
+    failure_reason: str | None = None,
+) -> int:
+    """Payout row. `fraud_score` / `fraud_decision` are stored LITERALS — the
+    rules engine does not recompute them at seed time, which is exactly the
+    lever that lets a scenario agree or disagree with its own history."""
+    platform_fee = round(amount * 0.05)
+    row = await conn.fetchrow(
+        f"""
+        INSERT INTO "Payout" (
+            status, amount, "platformFee", "sellerAmount",
+            "transactionId", "sellerId",
+            "escrowAccountId", "platformFeeAccountId",
+            attempts, "maxAttempts",
+            "fraudDecision", "fraudScore", "failureReason",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6,
+            $7, $8,
+            $9, 3,
+            $10, $11, $12,
+            NOW() - INTERVAL '{age_interval}', NOW() - INTERVAL '{age_interval}'
+        ) RETURNING id
+        """,
+        status, amount, platform_fee, amount - platform_fee,
+        transaction_id, seller_id,
+        escrow_account_id, platform_fee_account_id,
+        attempts,
+        fraud_decision, fraud_score, failure_reason,
+    )
+    return row["id"]
+
+
 # ── Scenario builders ───────────────────────────────────────────────────────
 #
-# One builder per row in eval/golden.jsonl. Register it in SCENARIO_BUILDERS
+# One builder per row in eval/golden.jsonl, registered in SCENARIO_BUILDERS
 # under the SAME string used in that row's "scenario" field.
 #
-# Insertion pattern (mirror tests/conftest.py::seed_blocked_payout):
-#   1. Look up (do NOT create) the platform ESCROW / PLATFORM_FEE accounts.
-#   2. Insert BUYER + SELLER Account   -> Account.name = marker
-#   3. Insert Seller                   -> name/email/stripeAccountId: DOMAIN data
-#   4. Insert Transaction              -> Transaction.description = marker
-#   5. Insert balanced Entry rows (DEBIT/CREDIT)
-#   6. Insert Payout (+ optional Dispute) -> failureReason: DOMAIN data
-#   7. return transaction_id
-#
-# Bodies are intentionally empty — the data pattern is a domain decision.
+# Every builder must keep the marker out of the four LLM-VISIBLE columns:
+#   Seller.name, Seller.email, Seller.stripeAccountId, Payout.failureReason
+# eval/guard.py enforces this at runtime.
 
 
-async def _build_placeholder_scenario(
+async def _build_fraud_confirmed_by_history(
     conn: asyncpg.Connection, scenario_key: str, marker: str
 ) -> int:
-    """TODO(domain): implement the data pattern for 'placeholder_scenario'.
+    """Fraud signal corroborated by seller behaviour.
 
-    Which data pattern justifies which verdict is the domain question to answer
-    here — e.g. what combination of fraud score, payout history, dispute state,
-    ledger balance and account age makes this case a TRUE_POSITIVE vs a
-    FALSE_POSITIVE vs INCONCLUSIVE (the label lives in eval/golden.jsonl).
+    Score arithmetic (fraud-engine/config/rules.yaml, weights all 1.0,
+    total = min(sum, 1.0), BLOCK above 0.7):
 
-    Marker placement (contamination-safe — NOT seen by the LLM):
-        Transaction.description = marker
-        Account.name            = marker   (BUYER and SELLER accounts)
+        amount_threshold  amount 45000 >= 10000        +0.50
+        velocity          6 payouts/24h >= 5           +0.20
+        new_account       age 3d < 7d                  +0.15
+        dispute_rate      1 dispute >= 1               +0.15
+        daily_volume      60000+45000 >= 50000         +0.40
+        ------------------------------------------------------
+        raw sum 1.40 -> capped 1.00 -> BLOCK
 
-    LLM-VISIBLE — MUST be domain-plausible, ZERO 'eval'/'test'/marker:
-        Seller.name, Seller.email, Seller.stripeAccountId, Payout.failureReason
+    The user-specified combination reaches 1.0 without daily_volume (0.5+0.2+
+    0.15+0.15); daily_volume also fires here but the cap makes it moot, so the
+    stored score stays 1.0 either way.
 
-    Must return the inserted transaction_id.
+    Every behavioural rule fires, so the stored score is fully corroborated by
+    the seller's own history — nothing for the agent to argue with.
+
+    Placement note (adjustable): the dispute sits on a HISTORY transaction, not
+    on the transaction under investigation. dispute_rate counts it either way
+    (it matches on transaction.payouts.some(sellerId)), but keeping it off the
+    main transaction avoids firing the unrelated `active_dispute` critical
+    finding, which would recommend "wait for dispute resolution" instead of a
+    fraud judgement. Move it to the main transaction if that is the intent.
     """
-    raise NotImplementedError(
-        f"eval builder for scenario '{scenario_key}' is not implemented yet"
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible merchant identity, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days'
+        ) RETURNING id
+        """,
+        "Lumen Trade Supply",
+        "payouts@lumen-trade-supply.com",
+        seller_account_id,
+        "acct_1QfLumenTradeSupply",
     )
+    seller_id = seller["id"]
+
+    # Velocity: five settled payouts inside the 24h window, plus the payout
+    # under investigation = 6 >= the rule's min_count of 5.
+    history_tx_ids: list[int] = []
+    for i in range(5):
+        hist_tx = await _insert_settled_transaction(
+            conn, marker, f"history-{i + 1}", buyer_account_id, escrow_id,
+            amount=12_000, age_interval=f"{4 + i * 3} hours",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=hist_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=12_000, status="PAID",
+            fraud_decision="ALLOW", fraud_score=0.15,
+            age_interval=f"{4 + i * 3} hours",
+        )
+        history_tx_ids.append(hist_tx)
+
+    # dispute_rate: one dispute against the seller's earlier trading.
+    await conn.execute(
+        """
+        INSERT INTO "Dispute" (status, reason, amount, "transactionId", "createdAt", "updatedAt")
+        VALUES ('OPEN', 'FRAUDULENT', $1, $2, NOW() - INTERVAL '6 hours', NOW() - INTERVAL '6 hours')
+        """,
+        12_000,
+        history_tx_ids[0],
+    )
+
+    # Transaction under investigation.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=45_000,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=45_000, status="PENDING",
+        fraud_decision="BLOCK", fraud_score=1.0,
+    )
+    return main_tx
+
+
+async def _build_high_score_clean_history(
+    conn: asyncpg.Connection, scenario_key: str, marker: str
+) -> int:
+    """High stored fraud score with nothing in the history to support it.
+
+    Same payout amount (45000) and the same BLOCK band as
+    `fraud_confirmed_by_history`, so the ONLY variable between the two cases is
+    the seller's history — the agent has to reach a different conclusion from
+    behaviour alone rather than from the score.
+
+    What rules.yaml would actually compute for THIS history:
+
+        amount_threshold  amount 45000 >= 10000        +0.50
+        daily_volume      45000 >= 20000               +0.15
+        velocity          1 payout/24h  < 5             0.00
+        new_account       age 4y       >= 30d           0.00
+        failed_history    0 failures    < 2             0.00
+        dispute_rate      0 disputes    < 1             0.00
+        ------------------------------------------------------
+        recomputed 0.65 -> REVIEW band, NOT block
+
+    The stored score is 0.85 (BLOCK), driven purely by transaction size: every
+    behavioural rule is zero. This is the discriminator — the agent has to
+    notice the score has nothing behind it.
+
+    Matches the existing labelled precedent in the corpus: SYN-017
+    (agent/rag/synthetic_cases.py, cluster `legitimate_high_risk`) is a
+    high-value purchase that trips amount_threshold on a long-tenured,
+    dispute-free customer and resolves to FALSE_POSITIVE.
+    """
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible long-established merchant, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '4 years', NOW() - INTERVAL '30 days'
+        ) RETURNING id
+        """,
+        "Hartmann Uhren Manufaktur",
+        "buchhaltung@hartmann-uhren.de",
+        seller_account_id,
+        "acct_1QfHartmannUhren",
+    )
+    seller_id = seller["id"]
+
+    # Exactly one payout, no history, no disputes, no failures.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=45_000,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=45_000, status="PENDING",
+        fraud_decision="BLOCK", fraud_score=0.85,
+    )
+    return main_tx
 
 
 # scenario_key -> builder. Keys MUST match the "scenario" field in golden.jsonl.
 SCENARIO_BUILDERS: dict[str, Builder] = {
-    "placeholder_scenario": _build_placeholder_scenario,
-    # "your_scenario_key": _build_your_scenario,
+    "fraud_confirmed_by_history": _build_fraud_confirmed_by_history,
+    "high_score_clean_history": _build_high_score_clean_history,
 }
