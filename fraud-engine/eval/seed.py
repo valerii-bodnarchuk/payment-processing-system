@@ -443,10 +443,10 @@ async def _build_high_score_clean_history(
             NOW() - INTERVAL '4 years', NOW() - INTERVAL '30 days'
         ) RETURNING id
         """,
-        "Hartmann Uhren Manufaktur",
-        "buchhaltung@hartmann-uhren.de",
+        "Ottokar Grienau Uhren Manufaktur",
+        "buchhaltung@grienau-uhren.de",
         seller_account_id,
-        "acct_1QfHartmannUhren",
+        "acct_1QfGrienauUhren",
     )
     seller_id = seller["id"]
 
