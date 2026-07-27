@@ -36,6 +36,10 @@ import asyncpg
 import numpy as np
 from pgvector.asyncpg import register_vector
 
+from env_bootstrap import load_env
+
+# Must run before the os.getenv below, or .env values lose to the default.
+load_env()
 
 DB_URL = os.getenv(
     "DATABASE_URL",

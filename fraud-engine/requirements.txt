@@ -2,6 +2,7 @@ fastapi
 uvicorn
 pydantic
 pyyaml
+python-dotenv
 pytest
 httpx
 asyncpg

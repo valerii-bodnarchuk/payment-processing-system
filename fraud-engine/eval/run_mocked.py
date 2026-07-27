@@ -1,7 +1,7 @@
 """
 Run eval/runner.py against real infra with a SCRIPTED judge instead of an LLM.
 
-No OPENAI_API_KEY here, so the LLM is replaced. Everything else is real:
+The LLM is replaced, so no OPENAI_API_KEY is needed. Everything else is real:
 Postgres, NestJS :3000, fraud engine :8000, graph routing, tool HTTP calls,
 contamination guard, scoring.
 
@@ -15,6 +15,11 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from langchain_core.messages import AIMessage
+
+from env_bootstrap import load_env
+
+# Must run before main() reads DATABASE_URL out of the environment.
+load_env()
 
 
 def _tool_call(name, args, call_id):

@@ -29,9 +29,14 @@ import os
 
 import asyncpg
 
+from env_bootstrap import load_env
+
 from eval.data import load_golden
 from eval.guard import assert_no_contamination
 from eval.seed import seed_eval_fixtures
+
+# Must run before the os.getenv below, or .env values lose to the defaults.
+load_env()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",

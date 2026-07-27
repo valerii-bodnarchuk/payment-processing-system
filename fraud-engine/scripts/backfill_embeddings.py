@@ -32,6 +32,12 @@ sys.path.insert(0, str(HERE.parents[1]))
 import asyncpg
 from pgvector.asyncpg import register_vector
 
+from env_bootstrap import load_env
+
+# Must run before main() reads DATABASE_URL and before the OpenAI client is
+# constructed for embedding.
+load_env()
+
 from agent.rag.cases import SEED_CASES
 from agent.rag.synthetic_cases import SYNTHETIC_CASES
 from agent.rag.embeddings import (
