@@ -45,7 +45,7 @@ def make_scripted_judge(trace):
             return await _judge(messages, *args, **kwargs)
         except Exception:
             import traceback
-            print("!!! ОШИБКА В МОКЕ (её глотает reason-нода):")
+            print("!!! ERROR INSIDE THE MOCK (the reason node swallows it):")
             traceback.print_exc()
             raise
 
@@ -54,7 +54,7 @@ def make_scripted_judge(trace):
         step = state["step"]
         tools_present = [getattr(m, "name", None) for m in messages
                          if type(m).__name__ == "ToolMessage"]
-        print(f"    [шаг {step}] сообщений={len(messages)} tool-выводов={tools_present}")
+        print(f"    [step {step}] messages={len(messages)} tool_outputs={tools_present}")
 
         if step == 1:
             tx = _tool_call("get_transaction_context",
@@ -183,14 +183,14 @@ async def main():
 
     print_report(summarise(results))
 
-    print("\n=== что агент реально увидел ===")
+    print("\n=== what the agent actually saw ===")
     for cid, t in traces.items():
         print(f"\n{cid}")
-        print(f"  записано в Payout : score={t.get('stored_score')} decision={t.get('stored_decision')}")
-        print(f"  движок пересчитал : score={t.get('recomputed_score')} decision={t.get('recomputed_decision')}")
-        print(f"  история           : {t.get('history')}")
-        print(f"  поведенческих     : {t.get('behavioural_signals')}")
-        print(f"  вывод             : {t.get('reason')}")
+        print(f"  stored on Payout  : score={t.get('stored_score')} decision={t.get('stored_decision')}")
+        print(f"  engine recomputed : score={t.get('recomputed_score')} decision={t.get('recomputed_decision')}")
+        print(f"  history           : {t.get('history')}")
+        print(f"  behavioural rules : {t.get('behavioural_signals')}")
+        print(f"  conclusion        : {t.get('reason')}")
 
 
 asyncio.run(main())

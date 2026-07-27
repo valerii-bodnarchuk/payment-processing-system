@@ -1,6 +1,6 @@
 import { Controller, Post, Body, Headers } from '@nestjs/common';
 import { ApiTags, ApiHeader } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler'; // ← используй встроенный
+import { Throttle } from '@nestjs/throttler'; // use the built-in throttler
 import { PaymentService } from './payment.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 
