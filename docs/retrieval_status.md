@@ -1,5 +1,12 @@
 # Similar-Cases Retrieval — Status
 
+> Agent-facing constraint: retrieval must stay OPTIONAL in the investigation
+> prompt until the corpus is balanced by verdict. The live tool ranks over the 6
+> `SEED_CASES` only (4 of them TRUE_POSITIVE), and making the call mandatory
+> measurably regressed eval accuracy. See
+> [agent_known_limitations.md](agent_known_limitations.md) for the numbers and
+> the exit condition.
+
 ## What landed
 
 **pgvector infrastructure** (`8646bce`): PostgreSQL `vector(384)` column on the
