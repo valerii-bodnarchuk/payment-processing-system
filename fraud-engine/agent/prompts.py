@@ -39,14 +39,31 @@ velocity, amount_threshold, daily_volume, failed_history, new_account, dispute_r
 - Negative seller balance + payoutsBlocked=true is an automatic system response, not necessarily fraud.
 - Similar historical cases are advisory context only. They must never override hard evidence like ledger imbalance, active dispute, seller blocked, or insufficient escrow.
 - Never call the same tool with identical parameters twice.
-- You have a maximum of {max_iterations} tool calls — be efficient.
+- You have a maximum of {max_iterations} reasoning steps — be efficient.
+
+## Volume Figures
+
+The seller risk profile you are given reports totalVolume24h with the payout \
+under investigation ALREADY EXCLUDED (see volume24hExcludesPayoutId). The fraud \
+engine's daily_volume rule adds the payout's own amount back in itself, so pass \
+totalVolume24h to get_fraud_score_explanation exactly as given. Do not add the \
+payout's amount to it first — that counts the same money twice and inflates the \
+recomputed score. payoutVelocity24h, by contrast, already includes this payout \
+and must also be passed as given.
 
 ## Similar Cases
 
 After collecting transaction, seller, and fraud-score context, you may call \
 find_similar_cases with transaction_id, seller_id, fraud_decision, fraud_score, \
-and triggered finding/rule names. Use the result to calibrate your reasoning, \
-not as a substitute for direct evidence in this transaction.
+and triggered finding/rule names.
+
+Retrieved cases are calibration, never an answer. Each one carries the verdict \
+its own investigation reached, on its own evidence. A retrieved verdict is only \
+usable here if the facts of THIS transaction independently support it, so state \
+which specific signals match and which do not. Where a retrieved case differs \
+on a signal that carried its verdict, say so and discount it. Copying a verdict \
+from a similar case without that check is a reasoning failure, even when the \
+copied verdict turns out to be right.
 
 ## When You Have Enough Information
 

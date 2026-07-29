@@ -86,6 +86,22 @@ async def collect_node(state: InvestigationState) -> dict:
     """
     Parallel data fetch — get transaction context before the reasoning loop.
     This is deterministic, not LLM-driven. Every investigation needs this data.
+
+    The risk profile is fetched with excludePayoutId set to the payout under
+    investigation. That is NOT an optimisation — it is required for the numbers
+    the LLM goes on to forward to the fraud engine to be correct.
+
+    The engine's daily_volume rule computes `seller_total_amount_24h + amount`,
+    i.e. it adds the payout being scored back in itself. Feed it a window total
+    that already contains that payout and it is counted twice, which inflates
+    the recomputed score above the stored one and makes a false positive look
+    corroborated.
+
+    This node is where the exclusion has to happen. `get_seller_risk_profile`
+    grew an `exclude_payout_id` parameter for the same reason, but the agent
+    never calls that tool — the profile is already in its first message, so
+    there is nothing left to fetch. Fixing the tool alone left the live path
+    unfixed; only repeated eval runs made that visible.
     """
     import asyncio
 
@@ -94,10 +110,15 @@ async def collect_node(state: InvestigationState) -> dict:
     # Fetch transaction context (includes payouts, entries, disputes)
     tx_data = await nestjs_get(f"/investigate/transaction/{tx_id}")
 
-    # Extract seller_id from first payout if available
+    # Extract seller_id and the payout under investigation from the first
+    # report. One transaction carries one payout in every current flow; if that
+    # ever changes, the first report is also what seller_id is taken from, so
+    # the two stay consistent by construction.
     seller_id = None
+    payout_id = None
     if tx_data and not tx_data.get("error") and tx_data.get("payoutReports"):
         seller_id = tx_data["payoutReports"][0].get("sellerId")
+        payout_id = tx_data["payoutReports"][0].get("payoutId")
     elif tx_data and not tx_data.get("error") and tx_data.get("hasPayouts") is False:
         pass  # No payouts — seller_id stays None
 
@@ -105,8 +126,11 @@ async def collect_node(state: InvestigationState) -> dict:
     seller_profile = None
     payout_timeline = None
     if seller_id:
+        # No payout_id (a transaction with no payout report) means nothing to
+        # exclude — the unfiltered total is then already the prior-window total.
+        profile_params = {"excludePayoutId": payout_id} if payout_id else None
         seller_profile, payout_timeline = await asyncio.gather(
-            nestjs_get(f"/admin/sellers/{seller_id}/risk-profile"),
+            nestjs_get(f"/admin/sellers/{seller_id}/risk-profile", params=profile_params),
             nestjs_get(f"/admin/sellers/{seller_id}/payout-timeline"),
         )
 
@@ -121,6 +145,14 @@ async def collect_node(state: InvestigationState) -> dict:
 
     if seller_profile and not seller_profile.get("error"):
         context_parts.append(f"**Seller risk profile:**\n```json\n{json.dumps(seller_profile, indent=2, default=str)[:2000]}\n```\n")
+        if payout_id:
+            # Stated next to the data, not just in the system prompt: this is the
+            # figure that gets forwarded to the engine, and the engine adds the
+            # payout's amount back in itself.
+            context_parts.append(
+                f"Note: `totalVolume24h` above EXCLUDES payout #{payout_id}, the one "
+                f"under investigation. Pass it to get_fraud_score_explanation as-is.\n"
+            )
 
     if payout_timeline and not payout_timeline.get("error"):
         context_parts.append(f"**Payout timeline:**\n```json\n{json.dumps(payout_timeline, indent=2, default=str)[:2000]}\n```\n")
