@@ -405,18 +405,21 @@ async def _build_high_score_clean_history(
         seller_total_amount_24h=0      -> total  45000 -> +0.15 -> 0.65 REVIEW
         seller_total_amount_24h=45000  -> total  90000 -> +0.40 -> 0.90 BLOCK
 
-    `get_seller_risk_profile` reports totalVolume24h over ALL payouts in the
-    window INCLUDING the one under investigation, so an agent that forwards it
-    verbatim double-counts this payout and the engine returns 0.90 BLOCK —
-    ABOVE the stored 0.85. The intended contradiction (recomputed < stored)
-    then disappears and the score looks corroborated instead.
+    Only the first of those preserves the contradiction this case exists to
+    measure (recomputed 0.65 < stored 0.85). Feed the window total unfiltered
+    and the payout is counted twice, the engine returns 0.90 — ABOVE the stored
+    0.85 — and a false positive reads as corroborated instead.
 
-    So this scenario only discriminates if the agent passes prior-window volume
-    (excluding the current payout). Confirmed against the live pipeline; both
-    numbers above came from POST /check/explain, not from arithmetic on paper.
-    Resolving this is a domain call: either treat "does the agent avoid the
-    double-count" as part of what is being measured, or move the case onto a
-    signal that does not route through daily_volume.
+    This case is what exposed that the fix had been applied in the wrong place.
+    `get_seller_risk_profile` gained an `exclude_payout_id` parameter, but the
+    agent never calls that tool: collect_node hands it the profile up front, so
+    there is nothing left to fetch. The live path went through collect_node,
+    which was still requesting the profile unfiltered, so the agent forwarded
+    45000 and concluded TRUE_POSITIVE — while the scripted judge in
+    eval/run_mocked.py, which calls the tool with exclude_payout_id itself, kept
+    passing. Same fixture, opposite results, and only repeated runs made the
+    split visible. collect_node now passes excludePayoutId (agent/nodes.py), so
+    the seller's prior-window volume here is 0 and the contradiction stands.
 
     Matches the existing labelled precedent in the corpus: SYN-017
     (agent/rag/synthetic_cases.py, cluster `legitimate_high_risk`) is a
@@ -580,9 +583,385 @@ async def _build_pending_burst_volume_spike(
     return main_tx
 
 
+async def _build_queued_backlog_after_transfer_failures(
+    conn: asyncpg.Connection, scenario_key: str, marker: str
+) -> int:
+    """Queue backlog that reads as draining OR as fallout from a platform outage.
+
+    The grey-zone case for the REVIEW trigger: the window volume is real and the
+    rule fires on it, but the failureReason text on the two dead payouts points
+    at the platform's own transfer path (api_connection_error, settlement-batch
+    lock timeout) rather than at anything the seller did. Both readings survive
+    the evidence, which is the point.
+
+    Score arithmetic (fraud-engine/config/rules.yaml, weights all 1.0,
+    total = min(sum, 1.0); REVIEW band is 0.3 <= score < 0.7). MEASURED against
+    the live engine via POST /check/explain, not derived on paper:
+
+        daily_volume      prior 48000 + amount 4800 = 52800 >= 50000   +0.40
+        failed_history    2 failures >= 2                              +0.20
+        amount_threshold  amount 4800  < 5000                           0.00
+        velocity          4 payouts/24h < 5                             0.00
+        new_account       age 400d     >= 30d                           0.00
+        dispute_rate      0 disputes    < 1                             0.00
+        --------------------------------------------------------------------
+        total 0.60 -> REVIEW
+
+    Deliberately insensitive to the totalVolume24h double-count that
+    `high_score_clean_history` and `pending_burst_volume_spike` bracket: the
+    unfiltered window total (52800) plus the amount lands at 57600, still over
+    the same 50000 tier, so the case scores 0.60 REVIEW under either convention
+    and stays grey no matter how the agent calls get_seller_risk_profile.
+
+    Two constraints hold the band and must be honoured by any edit:
+      - amount stays under 5000, or amount_threshold adds 0.20 (-> 0.80, BLOCK)
+        and the case turns into a second `high_score_clean_history`;
+      - at most 4 payouts inside 24h, or velocity adds 0.20 (-> 0.80, BLOCK).
+    The queued payouts are therefore FEW and LARGE (3 x 16000) while the payout
+    under investigation is small — volume without count, which is also what
+    separates this shape from `pending_burst_volume_spike`.
+
+    Placement note (adjustable): the two FAILED payouts sit 3d and 4d back —
+    inside the 7d failed_history lookback, outside the 24h volume window. Moving
+    them inside 24h adds 32000 to the volume (harmless, same tier) but pushes
+    velocity to 6 and the score to 0.80 BLOCK.
+    """
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible merchant identity, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '400 days', NOW() - INTERVAL '3 days'
+        ) RETURNING id
+        """,
+        "Halvorsen Marine Parts",
+        "settlements@halvorsen-marine.dk",
+        seller_account_id,
+        "acct_1QfHalvorsenMarine",
+    )
+    seller_id = seller["id"]
+
+    # failed_history: two payouts that exhausted all 3 attempts. The reasons are
+    # LLM-VISIBLE and carry the whole ambiguity — both name the platform's own
+    # transfer path, neither describes seller behaviour.
+    for i, (days_ago, reason) in enumerate(
+        ((3, "Stripe transfer failed: api_connection_error while creating transfer"),
+         (4, "Stripe transfer failed: lock_timeout on platform settlement batch")),
+    ):
+        failed_tx = await _insert_settled_transaction(
+            conn, marker, f"failed-{i + 1}", buyer_account_id, escrow_id,
+            amount=16_000, age_interval=f"{days_ago} days",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=failed_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=16_000, status="FAILED",
+            fraud_decision="ALLOW", fraud_score=0.20,
+            age_interval=f"{days_ago} days",
+            attempts=3, failure_reason=reason,
+        )
+
+    # The backlog: three large payouts sitting PENDING since releases were
+    # paused. 48000 of window volume in only three rows — the stored scores ramp
+    # as the volume accumulated under them, which the timeline tool surfaces.
+    for i, (hours_ago, stored_score, stored_decision) in enumerate(
+        ((19, 0.20, "ALLOW"), (11, 0.45, "REVIEW"), (6, 0.55, "REVIEW")),
+    ):
+        queued_tx = await _insert_settled_transaction(
+            conn, marker, f"queued-{i + 1}", buyer_account_id, escrow_id,
+            amount=16_000, age_interval=f"{hours_ago} hours",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=queued_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=16_000, status="PENDING",
+            fraud_decision=stored_decision, fraud_score=stored_score,
+            age_interval=f"{hours_ago} hours",
+        )
+
+    # Transaction under investigation: a small new order that inherits the
+    # backlog's volume. Stored score agrees with the recomputation (0.60) — the
+    # question here is what the volume MEANS, not whether the score is right.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=4_800,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=4_800, status="PENDING",
+        fraud_decision="REVIEW", fraud_score=0.60,
+    )
+    return main_tx
+
+
+async def _build_thin_history_single_signal(
+    conn: asyncpg.Connection, scenario_key: str, marker: str
+) -> int:
+    """One rule fires and there is no history to confirm or refute it.
+
+    The grey-zone case for the MANUAL trigger: an operator escalated this by
+    hand precisely because the automation had nothing to work with. The seller
+    is five days old with EXACTLY ONE payout — the one under investigation — so
+    every behavioural rule reads zero not because the seller is clean but
+    because the seller has no record at all. Absence of evidence, arriving in
+    the same shape as evidence of absence.
+
+    Score arithmetic (fraud-engine/config/rules.yaml, weights all 1.0,
+    total = min(sum, 1.0); REVIEW band is 0.3 <= score < 0.7). MEASURED against
+    the live engine via POST /check/explain, not derived on paper:
+
+        amount_threshold  amount 9600 >= 5000                          +0.20
+        new_account       age 5d       < 7d                            +0.15
+        velocity          1 payout/24h < 5                              0.00
+        daily_volume      prior 0 + amount 9600 = 9600  < 20000         0.00
+        failed_history    0 failures   < 2                              0.00
+        dispute_rate      0 disputes   < 1                              0.00
+        --------------------------------------------------------------------
+        total 0.35 -> REVIEW
+
+    0.35 sits low in the band ON PURPOSE: barely over the 0.3 ALLOW line is what
+    an escalation-by-hand looks like — not a score anyone would auto-block on.
+    The margin is thin, so the amount is held UNDER 10000 to keep the case grey
+    under either totalVolume24h convention: the unfiltered window total (9600)
+    plus the amount is 19200, still short of the 20000 daily_volume tier, so
+    the double-count cannot add 0.15 here. At amount >= 10000 it could, and the
+    case would flip to 0.80 BLOCK on a caller detail rather than on evidence.
+
+    Nearest precedent, and why this is not its twin: SEED_CASES
+    `case_new_seller_high_amount_true_positive` (agent/rag/cases.py) is also
+    new_account + amount_threshold on a seller with no history, and retrieval
+    WILL surface it — but it is a BLOCK-band case whose TRUE_POSITIVE rests on
+    a high-value payout, and 9600 sits in the engine's LOW amount tier (+0.20,
+    not +0.50). The overlap is the signal names; the magnitude that carried
+    that precedent's verdict is absent here.
+    """
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible newly-onboarded merchant, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days'
+        ) RETURNING id
+        """,
+        "Cassia Botanicals Studio",
+        "accounts@cassia-botanicals.co.uk",
+        seller_account_id,
+        "acct_1QfCassiaBotanicals",
+    )
+    seller_id = seller["id"]
+
+    # No history at all — this single payout IS the seller's entire record.
+    # Nothing else may be inserted here: one prior payout would give
+    # daily_volume something to work with and destroy the thin-data premise.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=9_600,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=9_600, status="PENDING",
+        fraud_decision="REVIEW", fraud_score=0.35,
+    )
+    return main_tx
+
+
+async def _build_clean_seller_volume_burst(
+    conn: asyncpg.Connection, scenario_key: str, marker: str
+) -> int:
+    """BLOCK earned by throughput alone on a seller with nothing against them.
+
+    The second false-alarm shape, built so it CANNOT lean on the mechanism that
+    carries `high_score_clean_history`: the amount is held under 5000, so
+    amount_threshold contributes nothing and the entire BLOCK comes from
+    velocity + daily_volume. Different rules, different reason to doubt.
+
+    Score arithmetic (fraud-engine/config/rules.yaml, weights all 1.0,
+    total = min(sum, 1.0), BLOCK at >= 0.7). MEASURED against the live engine
+    via POST /check/explain, not derived on paper:
+
+        velocity          12 payouts/24h >= 10                         +0.40
+        daily_volume      prior 49500 + amount 4500 = 54000 >= 50000    +0.40
+        amount_threshold  amount 4500   < 5000                           0.00
+        failed_history    0 failures    < 2                              0.00
+        new_account       age 3y       >= 30d                            0.00
+        dispute_rate      0 disputes    < 1                              0.00
+        --------------------------------------------------------------------
+        total 0.80 -> BLOCK
+
+    That combination is FORCED, not chosen. With amount_threshold excluded by
+    design and failed_history / dispute_rate / new_account all required to read
+    zero (a clean seller is the premise), the only path over 0.7 is the top tier
+    of both remaining rules: >= 10 payouts and >= 50000 in the window. Any edit
+    that drops either one drops the case out of BLOCK entirely.
+
+    Insensitive to the totalVolume24h double-count: unfiltered, the window total
+    is 54000 and the engine adds the amount again for 58500 — same 50000 tier,
+    same 0.80. Velocity is never reduced by exclude_payout_id, so it is stable
+    by construction.
+
+    What makes the burst explainable rather than suspicious is history the 24h
+    window cannot see: three years of trading, zero disputes, zero failures,
+    every payout in today's burst ALREADY PAID, an average payout amount that
+    today's 4500 sits right on top of, and a comparable 8-payout day 31 days
+    back that settled without incident.
+
+    HOW MUCH OF THAT THE AGENT CAN ACTUALLY SEE — measured, not assumed:
+      - The risk-profile aggregates are fully visible and carry most of the
+        argument: accountAgeDays 1096, totalDisputes 0, failedPayouts 0,
+        totalVolumeLifetime, avgPayoutAmount, firstPayoutDate.
+      - The 31-day burst and the 60/90/120/150-day steady payouts are NOT
+        visible. get_payout_timeline defaults to daysBack=30 and collect_node
+        does not override it, so anything older than 30 days is outside the
+        lookback entirely.
+      - Even inside 30 days the timeline is clipped: this seller's is 4080
+        chars against collect_node's [:2000] cut, and the endpoint orders newest
+        first, so 7 of 12 payouts survive and the 5 oldest are dropped.
+    So the "comparable burst a month ago" reads as designed evidence in this
+    fixture but never reaches the model. The case still discriminates on the
+    aggregates above; moving the prior burst inside the lookback only helps if
+    the truncation limit moves with it.
+
+    Nearest precedent, and why this is not its twin: SEED_CASES
+    `case_velocity_spike_true_positive` (agent/rag/cases.py) is the closest
+    match by signal overlap (decision:BLOCK + rule:velocity + risk:high) and
+    retrieval will surface it with a TRUE_POSITIVE verdict attached — pointing
+    the WRONG way. It is defined by two things this case deliberately lacks:
+    `rule:failed_history` (zero failures here) and, in its own words, "no
+    matching historical volume" — where this seller's lifetime aggregates show
+    steady trading at exactly today's amounts. An agent that copies the
+    retrieved verdict instead of reading those differences gets this case wrong,
+    which is what makes it worth scoring.
+
+    Placement note (adjustable): the historical burst sits at 31 days and the
+    steady payouts at 60/90/120/150 days, all far outside the 24h window, so
+    they add narrative without touching the arithmetic above. See the visibility
+    note above before treating them as evidence the agent weighs — currently
+    they are not.
+    """
+    escrow_id, fee_id = await _lookup_platform_accounts(conn)
+
+    buyer_account_id = await _insert_account(conn, marker, "BUYER")
+    seller_account_id = await _insert_account(conn, marker, "SELLER")
+
+    # LLM-VISIBLE: plausible long-established merchant, zero eval/test wording.
+    seller = await conn.fetchrow(
+        """
+        INSERT INTO "Seller" (
+            name, email, status, "accountId",
+            "stripeAccountId", "chargesEnabled", "payoutsEnabled",
+            "payoutsBlocked", "negativeBalance",
+            "createdAt", "updatedAt"
+        ) VALUES (
+            $1, $2, 'ACTIVE', $3,
+            $4, TRUE, TRUE,
+            FALSE, 0,
+            NOW() - INTERVAL '3 years', NOW() - INTERVAL '1 day'
+        ) RETURNING id
+        """,
+        "Bergqvist Antikvariat",
+        "ekonomi@bergqvist-antikvariat.se",
+        seller_account_id,
+        "acct_1QfBergqvistAntik",
+    )
+    seller_id = seller["id"]
+
+    # Steady baseline, months back: this seller has always traded.
+    for i, days_ago in enumerate((150, 120, 90, 60)):
+        steady_tx = await _insert_settled_transaction(
+            conn, marker, f"steady-{i + 1}", buyer_account_id, escrow_id,
+            amount=4_200, age_interval=f"{days_ago} days",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=steady_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=4_200, status="PAID",
+            fraud_decision="ALLOW", fraud_score=0.10,
+            age_interval=f"{days_ago} days",
+        )
+
+    # The precedent for today: an eight-payout day a month ago that settled
+    # cleanly. Outside the 24h window, so it is narrative only.
+    for i in range(8):
+        prior_burst_tx = await _insert_settled_transaction(
+            conn, marker, f"prior-burst-{i + 1}", buyer_account_id, escrow_id,
+            amount=4_400, age_interval=f"31 days {i * 2} hours",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=prior_burst_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=4_400, status="PAID",
+            fraud_decision="ALLOW", fraud_score=0.15,
+            age_interval=f"31 days {i * 2} hours",
+        )
+
+    # Today's burst: eleven payouts, ALL settled, 49500 of prior window volume.
+    # Stored scores ramp as the day's volume accumulated under them.
+    for i, hours_ago in enumerate((22, 20, 18, 16, 14, 12, 10, 8, 6, 4, 2)):
+        burst_tx = await _insert_settled_transaction(
+            conn, marker, f"burst-{i + 1}", buyer_account_id, escrow_id,
+            amount=4_500, age_interval=f"{hours_ago} hours",
+        )
+        await _insert_payout(
+            conn,
+            transaction_id=burst_tx, seller_id=seller_id,
+            escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+            amount=4_500, status="PAID",
+            fraud_decision="ALLOW" if i < 6 else "REVIEW",
+            fraud_score=0.15 if i < 6 else 0.55,
+            age_interval=f"{hours_ago} hours",
+        )
+
+    # Transaction under investigation — the twelfth payout of the day, the one
+    # that tips velocity into its top tier.
+    main_tx = await _insert_settled_transaction(
+        conn, marker, "main", buyer_account_id, escrow_id, amount=4_500,
+    )
+    await _insert_payout(
+        conn,
+        transaction_id=main_tx, seller_id=seller_id,
+        escrow_account_id=escrow_id, platform_fee_account_id=fee_id,
+        amount=4_500, status="PENDING",
+        fraud_decision="BLOCK", fraud_score=0.80,
+    )
+    return main_tx
+
+
 # scenario_key -> builder. Keys MUST match the "scenario" field in golden.jsonl.
 SCENARIO_BUILDERS: dict[str, Builder] = {
     "fraud_confirmed_by_history": _build_fraud_confirmed_by_history,
     "high_score_clean_history": _build_high_score_clean_history,
     "pending_burst_volume_spike": _build_pending_burst_volume_spike,
+    "queued_backlog_after_transfer_failures": _build_queued_backlog_after_transfer_failures,
+    "thin_history_single_signal": _build_thin_history_single_signal,
+    "clean_seller_volume_burst": _build_clean_seller_volume_burst,
 }
