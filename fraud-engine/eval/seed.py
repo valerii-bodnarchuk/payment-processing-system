@@ -472,7 +472,22 @@ async def _build_pending_burst_volume_spike(
 ) -> int:
     """A burst of UNSETTLED payouts inside the window — daily_volume MUST fire.
 
-    Regression guard for the risk-profile aggregate itself, not for the LLM.
+    Labelled TRUE_POSITIVE. Six payouts queued inside 24h, two failures inside
+    the week, and window volume that corroborates the spike rather than merely
+    coinciding with it: four of the six rules fire and the recomputed score
+    (1.00) sits at or above the stored 0.95, so there is no contradiction to
+    argue from. This reads as seller behaviour, not as platform trouble.
+
+    Caveat on that last clause, since the fixture data only half-supports it:
+    of the two failureReason strings the agent can read, `account_frozen on
+    destination account` is squarely seller-side, but `insufficient_funds in
+    platform balance` is platform-side. The verdict rests on the rule evidence
+    above, not on the failure text. Making the pairing with
+    `queued_backlog_after_transfer_failures` (whose reasons are BOTH
+    platform-path) a clean contrast would mean moving that first reason to
+    something seller-attributable — a fixture change, not done here.
+
+    Also a regression guard for the risk-profile aggregate itself.
     The window volume here lives entirely in payouts that have NOT settled yet
     (all PENDING), which is exactly the shape a payout-draining seller has: the
     money is queued, not paid out. Any implementation of `totalVolume24h` that
