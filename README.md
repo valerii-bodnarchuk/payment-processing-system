@@ -148,7 +148,7 @@ The `reason ⇄ tool_executor` loop is the ReAct pattern. The conditional edge a
 
 ### Read-Only Tool Boundary
 
-All five agent tools are read-only HTTP calls. The agent cannot mutate payout state, ledger entries, or dispute records. Enforced structurally — the tool registry contains no write endpoints.
+All six agent tools are read-only. The agent cannot mutate payout state, ledger entries, or dispute records. Enforced structurally — the tool registry contains no write endpoints.
 
 | Tool | Endpoint | Reads |
 |------|----------|-------|
@@ -157,6 +157,7 @@ All five agent tools are read-only HTTP calls. The agent cannot mutate payout st
 | `get_payout_timeline` | `GET /admin/sellers/:id/payout-timeline` | Chronological payouts with trend analysis |
 | `check_ledger_consistency` | `GET /ledger/integrity` + `GET /ledger/balance/:id` | Global balance, per-account balance |
 | `get_fraud_score_explanation` | `POST /check/explain` | Rule-by-rule fraud score breakdown |
+| `find_similar_cases` | local corpus, no I/O | Historical cases ranked by signal overlap |
 
 Tools never raise exceptions into the graph. Every HTTP error (4xx, 5xx, connection failure) is caught and returned as a typed error dict `{ error: true, status_code, detail }`. The agent can reason about tool failures as evidence.
 
@@ -173,6 +174,87 @@ The full trail, verdict JSON, and iteration count are persisted to `Investigatio
 ### Testing Without an LLM Key
 
 The E2E suite (`tests/test_agent_e2e.py`) mocks the LLM with scripted tool-calling sequences. The mock returns a deterministic sequence: `tool_call → INVESTIGATION_COMPLETE → JSON verdict`. Everything else is real: graph routing, tool HTTP calls to a live NestJS server, PostgreSQL seed/teardown, httpx connections, audit trail ordering. CI runs without an OpenAI key.
+
+---
+
+## Agent Evaluation
+
+Tests assert the graph *runs*. The eval harness (`fraud-engine/eval/`) measures whether the agent *reasons correctly* — a separate question with a separate failure mode, and one that cannot be answered with a pass/fail assertion because the agent is not deterministic.
+
+### Harness
+
+| File | Purpose |
+|------|---------|
+| `golden.jsonl` | The dataset. One case per line: `id`, `scenario`, `trigger`, `expected.verdict` |
+| `data.py` | `load_golden()` + strict validation — a malformed case fails loudly with `file:line` context |
+| `seed.py` | Idempotent asyncpg fixture seeding. `SCENARIO_BUILDERS: {scenario_key → builder}`, one transaction per builder, returns `{scenario: transaction_id}` |
+| `guard.py` | `assert_no_contamination()` — proves the eval marker never reached the LLM |
+| `runner.py` | Runner + CLI |
+| `run_mocked.py` | Same runner, scripted judge instead of an LLM. No OpenAI key required |
+
+Cases reference fixtures by a **logical scenario key**, never a raw database id. Fixtures are re-seeded and re-mapped on every run, so the dataset survives a wiped database.
+
+### Contamination Guard
+
+Fixtures carry an opaque marker `EVAL::<hash>`, written **only** into `Transaction.description` and `Account.name` — columns no tool serialises to the LLM. Domain-visible columns (`Seller.name`, `Seller.email`, `Seller.stripeAccountId`, `Payout.failureReason`) hold plausible merchant data with no eval wording.
+
+After each invocation the guard recursively scans everything the model actually saw — message content, tool-call arguments, tool outputs, collected context — and raises if the marker appears anywhere. It runs **before** scoring: a leaked marker means the fixture is invalid, so it stops the run rather than quietly inflating accuracy.
+
+### Scoring Across Repeated Runs
+
+A single pass samples the agent once. `--runs N` invokes each case N times **sequentially** and scores it as the *fraction* of runs matching the expected verdict:
+
+```
+case-002-high-score-clean-history    FALSE_POSITIVE   0.40 (2/5)   UNSTABLE
+                                       verdicts: TP x3, FP x2
+```
+
+- **Overall accuracy is the mean of per-case fractions**, not of all runs — every case weighs the same regardless of how many runs it took.
+- **A fraction strictly between 0 and 1 is flagged `UNSTABLE`.** Answering differently on identical input is a distinct failure mode from being consistently wrong: it places the case on the model's decision boundary. `passed` counts only cases correct on *every* run, so the exit code stays honest.
+- **A crashed run counts as a wrong run**, not an aborted eval — an agent that falls over intermittently is exactly what repeated runs exist to expose.
+- Runs are sequential by design: fixtures are shared mutable rows in one database and every invocation writes an audit trail.
+
+Repeated runs earn their cost. A double-counting bug in the volume figure forwarded to the fraud engine was invisible to the scripted judge — which passed the parameter correctly itself — and looked like noise in single runs. Across five runs it showed as the same wrong verdict 4 times out of 5 on the one case built to catch it, which is what turned "the agent got this wrong" into "the live path never receives the right number."
+
+### Retrieval Audit
+
+`find_similar_cases` returns historical cases **with their verdicts attached**, so a near-duplicate in the corpus can hand the agent its answer. Every run records whether the tool was consulted at all (counting tool messages, not returned cases — a call with zero matches is not the same fact as no call) and which verdicts it surfaced, with per-hit run counts and a `<-- matches expected` flag.
+
+### Golden Dataset
+
+Six cases, balanced across verdicts and triggers, with all rule arithmetic measured against the live fraud engine rather than derived on paper:
+
+| Case | Trigger | Expected | Rests on |
+|------|---------|----------|---------|
+| `fraud_confirmed_by_history` | BLOCK | TRUE_POSITIVE | Every behavioural rule fires; score fully corroborated |
+| `high_score_clean_history` | BLOCK | FALSE_POSITIVE | Stored 0.85 vs recomputed 0.65 on a 4-year dispute-free seller |
+| `pending_burst_volume_spike` | BLOCK | TRUE_POSITIVE | Unsettled queue volume; regression guard for `totalVolume24h` |
+| `queued_backlog_after_transfer_failures` | REVIEW | INCONCLUSIVE | Real volume, but failures name the platform's own transfer path |
+| `thin_history_single_signal` | MANUAL | INCONCLUSIVE | One low-tier signal, no history to confirm or refute it |
+| `clean_seller_volume_burst` | BLOCK | FALSE_POSITIVE | Throughput-only block on a 3-year seller, zero disputes, zero failures |
+
+Grey-zone cases are pinned inside the REVIEW band (0.3–0.7) and verified stable under either `totalVolume24h` convention, so they measure judgement rather than a caller detail.
+
+### Running It
+
+Requires PostgreSQL (seeded via `npm run prisma:seed` — the platform ESCROW / PLATFORM_FEE accounts are reused read-only), NestJS on `:3000`, and the fraud engine on `:8000`. `eval.runner` additionally needs `OPENAI_API_KEY`, loaded from `.env` by `env_bootstrap`.
+
+```bash
+cd fraud-engine && source venv/bin/activate
+
+python -m eval.runner              # seed + run once
+python -m eval.runner --runs 5     # 5 passes per case, fractional scores
+python -m eval.runner --no-seed    # reuse rows already in the DB
+
+# No OpenAI key — scripted judge, everything else real
+python -m eval.run_mocked
+```
+
+Most recent 5-run sample: **`passed 4/6, accuracy 0.83, 2 unstable`**. The two unstable cases are exactly the two labelled `FALSE_POSITIVE` — the agent is reluctant to overturn a BLOCK-band stored score even when the seller's history gives it no support, which is the one systematic weakness this dataset currently exposes.
+
+Treat that figure as a sample, not a property. Two consecutive 5-run samples both landed on 0.83 overall while disagreeing on composition: `high_score_clean_history` scored 0.40 then 0.20, `clean_seller_volume_burst` 0.60 then 0.80. Thirty invocations of a non-deterministic agent carry that much variance, so the per-case distributions — and above all *which* cases are unstable — are the durable signal, not the headline number.
+
+Known limitations of the agent found by this harness, with the evidence and the exit condition for each, are recorded in [`docs/agent_known_limitations.md`](docs/agent_known_limitations.md).
 
 ---
 
