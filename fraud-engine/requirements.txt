@@ -13,3 +13,4 @@ pytest-asyncio
 tenacity
 pgvector
 sentence-transformers>=2.7.0
+fastmcp>=2.0
