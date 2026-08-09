@@ -344,4 +344,6 @@ async def audit_node(state: InvestigationState) -> dict:
         }, default=str)
     )
 
-    return {"audit_trail": full_trail}
+    # run_id is None when persistence was skipped or failed — callers must
+    # tolerate its absence rather than treat it as a broken run.
+    return {"audit_trail": full_trail, "run_id": persist_result.get("run_id")}

@@ -26,6 +26,8 @@ class InvestigateResponse(BaseModel):
     verdict: dict
     audit_trail: list[dict] = Field(default_factory=list)
     iterations_used: int
+    # None when the run was not persisted (no DATABASE_URL, or a write failure).
+    run_id: int | None = None
 
 
 @router.post("", response_model=InvestigateResponse)
@@ -64,6 +66,7 @@ async def investigate(req: InvestigateRequest):
         verdict=verdict,
         audit_trail=result.get("audit_trail", []),
         iterations_used=result.get("iteration", 0),
+        run_id=result.get("run_id"),
     )
 
 

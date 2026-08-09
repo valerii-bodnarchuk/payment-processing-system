@@ -39,3 +39,6 @@ class InvestigationState(TypedDict, total=False):
     # ── Output ───────────────────────────────────────────────────
     verdict: dict | None
     audit_trail: list[dict]
+    # InvestigationRun.id from audit_node's persistence step. None when
+    # persistence is skipped or fails — it is best-effort, never fatal.
+    run_id: int | None
