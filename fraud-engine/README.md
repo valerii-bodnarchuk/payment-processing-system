@@ -113,6 +113,58 @@ Returns precision/recall stats across all reported outcomes.
 `precision` and `recall` are `null` until enough outcomes are reported to compute them.
 Outcomes are stored in memory — not persisted across restarts.
 
+## MCP server
+
+The investigation agent is also exposed over MCP, so other agents (Cursor, Claude
+Desktop, any MCP host) can call it as a tool.
+
+```bash
+cd fraud-engine
+source venv/bin/activate
+python -m agent.mcp_server          # stdio
+```
+
+Client config — `~/.cursor/mcp.json` or `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "fraud-investigation": {
+      "command": "/absolute/path/to/fraud-engine/venv/bin/python",
+      "args": ["-m", "agent.mcp_server"],
+      "cwd": "/absolute/path/to/fraud-engine",
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "NESTJS_BASE_URL": "http://localhost:3000",
+        "DATABASE_URL": "postgresql://..."
+      }
+    }
+  }
+}
+```
+
+The server starts without `OPENAI_API_KEY` — the graph is imported lazily on the
+first tool call — but an investigation will fail without one.
+
+### Why the tool contract is not 1:1 with `POST /investigate`
+
+The REST endpoint serves a human and returns the full audit trail inline; an MCP
+host pays context tokens for every byte a tool returns, so the tool returns a
+compact verdict and parks the trail behind the `investigation://{run_key}/audit`
+resource, which the caller fetches only when it needs the evidence. And because
+agents retry on their own initiative — where one investigation costs several LLM
+round trips — calls are idempotent by `idempotency_key`: a repeat returns the
+first result with `replayed: true`, and a call arriving mid-run joins the
+in-flight one rather than starting a second.
+
+| Surface | Returns | Idempotent |
+|---------|---------|------------|
+| `POST /investigate` | verdict + full audit trail | no |
+| `investigate_transaction` (MCP) | compact verdict + `audit_uri` | yes, by `run_key` |
+
+Idempotency state is process-local. The durable version keys off `InvestigationRun`
+with a unique index on `(transactionId, idempotencyKey)` — not implemented yet.
+
 ## Tests
 
 ```bash
