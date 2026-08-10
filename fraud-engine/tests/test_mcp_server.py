@@ -353,3 +353,25 @@ async def test_round_trip_over_mcp_protocol():
             assert second.data.run_key == first.data.run_key
 
     assert graph.ainvoke.await_count == 1
+
+
+async def test_advertised_tool_schema_over_protocol():
+    """What a host actually sees when it enumerates this server.
+
+    The description is the text a calling model reasons over, and the input
+    schema is what it fills in — both are part of the contract, so a silent
+    change to either should fail here.
+    """
+    async with Client(mcp_server.mcp) as client:
+        tools = await client.list_tools()
+
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool.name == "investigate_transaction"
+    assert tool.description and tool.description.strip()
+
+    properties = tool.inputSchema["properties"]
+    assert {"transaction_id", "trigger", "idempotency_key"} <= set(properties)
+    # Only the transaction is mandatory; the other two carry defaults.
+    assert tool.inputSchema["required"] == ["transaction_id"]
+    assert properties["trigger"]["enum"] == ["BLOCK", "REVIEW", "MANUAL"]
