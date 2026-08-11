@@ -39,6 +39,12 @@ class InvestigationState(TypedDict, total=False):
     # ── Output ───────────────────────────────────────────────────
     verdict: dict | None
     audit_trail: list[dict]
+    # True when the verdict did not come from a complete reasoning pass.
+    # degradation_reason carries which failure caused it (see agent.nodes
+    # DEGRADATION_*). Structured on purpose: a consumer must never have to
+    # infer this from confidence or parse it out of the summary text.
+    degraded: bool
+    degradation_reason: str | None
     # InvestigationRun.id from audit_node's persistence step. None when
     # persistence is skipped or fails — it is best-effort, never fatal.
     run_id: int | None

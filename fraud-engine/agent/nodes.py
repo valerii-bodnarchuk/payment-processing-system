@@ -32,12 +32,40 @@ def _get_llm():
     return ChatOpenAI(model=OPENAI_MODEL, temperature=0)
 
 
-def _fallback_verdict(reason: str) -> dict:
-    """Safe manual-review verdict when the LLM cannot produce a conclusion."""
+# ── Degradation reasons ──────────────────────────────────────────
+#
+# A degraded verdict is syntactically valid but was not reasoned to. Consumers
+# need to tell the two apart, and the distinction is only knowable here, at the
+# moment the fallback is built — so it is recorded as structured state rather
+# than left to be inferred downstream.
+#
+# Transient reasons are worth retrying as-is; non-transient ones will reproduce
+# on an identical retry and need something about the request or the agent to
+# change first.
+DEGRADATION_LLM_UNAVAILABLE = "LLM_UNAVAILABLE"        # provider call raised
+DEGRADATION_OUTPUT_UNPARSEABLE = "OUTPUT_UNPARSEABLE"  # model returned non-JSON
+DEGRADATION_ITERATIONS_EXHAUSTED = "ITERATIONS_EXHAUSTED"  # cap hit, never concluded
+
+TRANSIENT_DEGRADATIONS = frozenset({DEGRADATION_LLM_UNAVAILABLE})
+
+
+def is_transient_degradation(reason: str | None) -> bool:
+    """Whether a degradation reason is worth retrying unchanged."""
+    return reason in TRANSIENT_DEGRADATIONS
+
+
+def _fallback_verdict(reason: str, code: str = DEGRADATION_LLM_UNAVAILABLE) -> dict:
+    """Safe manual-review verdict when the LLM cannot produce a conclusion.
+
+    Carries the degradation marker on the verdict itself so it survives being
+    read in isolation, e.g. straight out of InvestigationRun.verdictPayload.
+    """
     return {
         "verdict": "INCONCLUSIVE",
         "confidence": 0.1,
         "risk_level": "medium",
+        "degraded": True,
+        "degradation_reason": code,
         "summary": f"Agent could not complete LLM reasoning: {reason}",
         "key_findings": ["LLM investigation step failed."],
         "evidence": [
@@ -208,10 +236,15 @@ async def reason_node(state: InvestigationState) -> dict:
             "detail": detail[:500],
         }
 
+        # Forcing INVESTIGATION_COMPLETE sends a half-finished investigation to
+        # synthesis. Mark it here: synthesis may still succeed on the context
+        # collected so far, and that verdict would otherwise look complete.
         return {
             "messages": [AIMessage(content="INVESTIGATION_COMPLETE")],
             "iteration": new_iteration,
             "audit_trail": state.get("audit_trail", []) + [audit_entry],
+            "degraded": True,
+            "degradation_reason": DEGRADATION_LLM_UNAVAILABLE,
         }
 
     audit_entry = {
@@ -270,11 +303,15 @@ async def synthesize_node(state: InvestigationState) -> dict:
             "verdict": verdict.get("verdict"),
             "confidence": verdict.get("confidence"),
             "risk_level": verdict.get("risk_level"),
+            "degraded": True,
+            "degradation_reason": DEGRADATION_LLM_UNAVAILABLE,
         }
 
         return {
             "verdict": verdict,
             "audit_trail": state.get("audit_trail", []) + [audit_entry, verdict_entry],
+            "degraded": True,
+            "degradation_reason": DEGRADATION_LLM_UNAVAILABLE,
         }
 
     # Parse the JSON verdict
@@ -293,11 +330,34 @@ async def synthesize_node(state: InvestigationState) -> dict:
             "verdict": "INCONCLUSIVE",
             "confidence": 0.1,
             "risk_level": "medium",
+            "degraded": True,
+            "degradation_reason": DEGRADATION_OUTPUT_UNPARSEABLE,
             "summary": "Agent failed to produce structured output. Raw response available in audit trail.",
             "key_findings": [],
             "evidence": [],
             "recommended_actions": ["Manual review required — agent output parsing failed."],
         }
+
+    # Degradation is sticky: reason_node may already have flagged a failed
+    # reasoning leg, and a successful synthesis on partial context does not
+    # undo that. Its reason wins, being the earlier and proximate cause.
+    degraded = bool(state.get("degraded", False))
+    degradation_reason = state.get("degradation_reason")
+
+    if verdict.get("degraded"):
+        degraded = True
+        degradation_reason = degradation_reason or verdict.get("degradation_reason")
+    elif state.get("iteration", 0) >= MAX_ITERATIONS:
+        # The router forced synthesis at the cap, so the model never signalled
+        # INVESTIGATION_COMPLETE — this verdict was cut off, not concluded.
+        degraded = True
+        degradation_reason = degradation_reason or DEGRADATION_ITERATIONS_EXHAUSTED
+
+    # Keep the verdict payload self-describing when the degradation was
+    # detected out here rather than built into the verdict itself.
+    if degraded:
+        verdict.setdefault("degraded", True)
+        verdict.setdefault("degradation_reason", degradation_reason)
 
     audit_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -305,11 +365,15 @@ async def synthesize_node(state: InvestigationState) -> dict:
         "verdict": verdict.get("verdict"),
         "confidence": verdict.get("confidence"),
         "risk_level": verdict.get("risk_level"),
+        "degraded": degraded,
+        "degradation_reason": degradation_reason,
     }
 
     return {
         "verdict": verdict,
         "audit_trail": state.get("audit_trail", []) + [audit_entry],
+        "degraded": degraded,
+        "degradation_reason": degradation_reason,
     }
 
 

@@ -28,6 +28,13 @@ class InvestigateResponse(BaseModel):
     iterations_used: int
     # None when the run was not persisted (no DATABASE_URL, or a write failure).
     run_id: int | None = None
+    # True when the verdict did not come from a complete reasoning pass. Still
+    # returned with 200: a degraded verdict carries the collected context and is
+    # useful to the human reading it — it just must not be mistaken for a
+    # reasoned one. degradation_reason names the failure (agent.nodes
+    # DEGRADATION_*).
+    degraded: bool = False
+    degradation_reason: str | None = None
 
 
 @router.post("", response_model=InvestigateResponse)
@@ -67,6 +74,8 @@ async def investigate(req: InvestigateRequest):
         audit_trail=result.get("audit_trail", []),
         iterations_used=result.get("iteration", 0),
         run_id=result.get("run_id"),
+        degraded=bool(result.get("degraded", False)),
+        degradation_reason=result.get("degradation_reason"),
     )
 
 
