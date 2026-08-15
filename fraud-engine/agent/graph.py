@@ -19,6 +19,7 @@ from agent.state import InvestigationState
 from agent.tools.registry import ALL_TOOLS
 from agent.config import MAX_ITERATIONS
 from agent.nodes import (
+    _message_text,
     start_node,
     collect_node,
     reason_node,
@@ -49,7 +50,9 @@ def _route_after_reason(state: InvestigationState) -> str:
         return "tools"
 
     # Check for completion signal
-    content = getattr(last_message, "content", "") or ""
+    # Bedrock returns content as a list of blocks; `in` against a list would
+    # test element membership and never find the signal.
+    content = _message_text(getattr(last_message, "content", None))
     if "INVESTIGATION_COMPLETE" in content:
         return "synthesize"
 

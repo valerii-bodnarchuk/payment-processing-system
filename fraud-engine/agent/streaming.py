@@ -11,6 +11,8 @@ import json
 import logging
 from typing import AsyncIterator
 
+from agent.nodes import _message_text
+
 logger = logging.getLogger("agent.streaming")
 
 
@@ -42,7 +44,7 @@ def _summarize_delta(node_name: str, delta: dict | None) -> dict:
             {
                 "type": type(m).__name__,
                 "name": getattr(m, "name", None),
-                "preview": (getattr(m, "content", "") or "")[:200],
+                "preview": _message_text(getattr(m, "content", None))[:200],
                 "tool_calls": [
                     {"name": tc.get("name"), "args": tc.get("args")}
                     for tc in (getattr(m, "tool_calls", None) or [])

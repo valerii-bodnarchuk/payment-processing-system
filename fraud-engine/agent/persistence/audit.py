@@ -36,6 +36,10 @@ def _parse_timestamp(value: Any) -> datetime:
 
 
 def _extract_tool_calls(messages: list[Any]) -> list[dict]:
+    # Imported here, not at module scope: agent.nodes imports this module for
+    # persist_investigation_run, so a top-level import would be circular.
+    from agent.nodes import _message_text
+
     calls: list[dict] = []
     for index, msg in enumerate(messages):
         tool_calls = getattr(msg, "tool_calls", None)
@@ -55,7 +59,7 @@ def _extract_tool_calls(messages: list[Any]) -> list[dict]:
                 "message_index": index,
                 "type": "tool_result",
                 "name": name,
-                "content": (getattr(msg, "content", "") or "")[:4000],
+                "content": _message_text(getattr(msg, "content", None))[:4000],
             })
 
     return calls
