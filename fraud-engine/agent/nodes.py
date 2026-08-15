@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from agent.config import MAX_ITERATIONS, OPENAI_MODEL
+from agent.config import MAX_ITERATIONS
+from agent.llm import get_chat_model
 from agent.prompts import REACT_SYSTEM_PROMPT, SYNTHESIS_PROMPT
 from agent.persistence.audit import persist_investigation_run
 from agent.state import InvestigationState
@@ -27,9 +28,13 @@ logger = logging.getLogger("agent.nodes")
 
 
 def _get_llm():
-    """Lazy LLM init — avoids import-time API key requirement for tests."""
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+    """Lazy LLM init — avoids import-time credential requirements for tests.
+
+    Kept as a thin delegator rather than inlining get_chat_model() at the two
+    call sites: it is the patch target for the whole test suite and for
+    eval/run_mocked.py, which swaps in a scripted judge.
+    """
+    return get_chat_model()
 
 
 # ── Degradation reasons ──────────────────────────────────────────

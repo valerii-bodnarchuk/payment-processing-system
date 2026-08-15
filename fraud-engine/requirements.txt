@@ -14,3 +14,4 @@ tenacity
 pgvector
 sentence-transformers>=2.7.0
 fastmcp>=2.0
+langchain-aws>=0.2.0
