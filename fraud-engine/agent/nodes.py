@@ -27,6 +27,40 @@ from agent.tools.registry import ALL_TOOLS
 logger = logging.getLogger("agent.nodes")
 
 
+def _message_text(content: object) -> str:
+    """Flatten LangChain message content to plain text.
+
+    Providers disagree on the shape: ChatOpenAI returns a string, while
+    ChatBedrockConverse returns a list of content blocks
+    (``[{"type": "text", "text": "..."}]``). Normalising on the *shape* rather
+    than on the configured provider is what keeps this correct — the same
+    provider returns both shapes depending on the model and on whether
+    reasoning blocks are enabled, so the provider name does not predict it.
+
+    Non-text blocks (tool_use, reasoning_content) are dropped rather than
+    stringified: they are carried separately on ``tool_calls`` and would
+    otherwise be concatenated into a prompt as JSON noise.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                # An untyped block carrying "text" is still text; anything
+                # explicitly typed as something else is not.
+                if block.get("type") in (None, "text"):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
 def _get_llm():
     """Lazy LLM init — avoids import-time credential requirements for tests.
 
@@ -257,7 +291,7 @@ async def reason_node(state: InvestigationState) -> dict:
         "action": "llm_reasoning",
         "iteration": new_iteration,
         "has_tool_calls": bool(response.tool_calls),
-        "content_preview": (response.content or "")[:200],
+        "content_preview": _message_text(response.content)[:200],
     }
 
     return {
@@ -283,9 +317,12 @@ async def synthesize_node(state: InvestigationState) -> dict:
         HumanMessage(content=(
             "Here is the full investigation context from the reasoning steps:\n\n"
             + "\n".join(
-                msg.content or ""
-                for msg in state.get("messages", [])
-                if hasattr(msg, "content") and msg.content
+                text
+                for text in (
+                    _message_text(getattr(msg, "content", None))
+                    for msg in state.get("messages", [])
+                )
+                if text
             )[-6000:]  # trim to last ~6k chars to fit context
         )),
     ]
@@ -322,7 +359,7 @@ async def synthesize_node(state: InvestigationState) -> dict:
     # Parse the JSON verdict
     verdict = None
     try:
-        raw = response.content.strip()
+        raw = _message_text(response.content).strip()
         # Strip markdown fences if the LLM wraps them anyway
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -330,7 +367,9 @@ async def synthesize_node(state: InvestigationState) -> dict:
             raw = raw[:-3]
         verdict = json.loads(raw.strip())
     except (json.JSONDecodeError, IndexError):
-        logger.error(f"Failed to parse verdict JSON: {response.content[:500]}")
+        logger.error(
+            f"Failed to parse verdict JSON: {_message_text(response.content)[:500]}"
+        )
         verdict = {
             "verdict": "INCONCLUSIVE",
             "confidence": 0.1,
