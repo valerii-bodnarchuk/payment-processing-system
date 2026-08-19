@@ -15,3 +15,11 @@ pgvector
 sentence-transformers>=2.7.0
 fastmcp>=2.0
 langchain-aws>=0.2.0
+# OpenTelemetry — pinned as a set. opentelemetry-api 1.44.0 arrives transitively
+# via fastmcp/langsmith, and the SDK pins the API exactly, so the core packages
+# must all sit on 1.44.0. Instrumentation versions are a separate 0.x line:
+# 0.65b0 is the release paired with core 1.44.0 (its semantic-conventions
+# dependency pins opentelemetry-api==1.44.0). Bump the two lines together.
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-grpc==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0

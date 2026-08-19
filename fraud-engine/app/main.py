@@ -1,4 +1,6 @@
 import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from app.models import (
     FraudCheckRequest,
@@ -12,10 +14,46 @@ from app.models import (
 from app.rules.engine import evaluate
 from app.config import CONFIG
 
+_telemetry_log = logging.getLogger("agent.telemetry")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start tracing on boot, flush it on shutdown.
+
+    Both halves are guarded: tracing is observability, and a broken exporter or
+    a missing opentelemetry install must not take the fraud engine with it. The
+    import is local so that a machine without the OTel packages still serves
+    /check — same reasoning as the optional agent router below.
+    """
+    shutdown = None
+    try:
+        from agent.telemetry import setup_telemetry, shutdown_telemetry
+
+        setup_telemetry()
+        shutdown = shutdown_telemetry
+    except Exception:
+        _telemetry_log.warning(
+            "Telemetry initialisation failed — continuing without tracing",
+            exc_info=True,
+        )
+
+    yield
+
+    if shutdown is not None:
+        try:
+            # Flushes the BatchSpanProcessor; without it the last batch of spans
+            # dies with the process.
+            shutdown()
+        except Exception:
+            _telemetry_log.warning("Telemetry shutdown failed", exc_info=True)
+
+
 app = FastAPI(
     title="Fraud Engine",
     description="Rule-based fraud scoring for payment processing",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # In-memory outcome store — demo only, not persisted across restarts
@@ -152,3 +190,20 @@ except ImportError:
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "fraud-engine"}
+
+
+# ── HTTP instrumentation (last: every route must already be registered) ──
+#
+# `/health` matches both this app's probe and the agent's /investigate/health.
+# Excluding them keeps liveness polling out of the trace store, where it would
+# otherwise be the overwhelming majority of spans. There is no Python /metrics
+# endpoint — Prometheus metrics live on the NestJS side.
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app, excluded_urls="/health")
+except Exception:
+    _telemetry_log.warning(
+        "FastAPI instrumentation unavailable — HTTP spans disabled",
+        exc_info=True,
+    )
